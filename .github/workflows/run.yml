@@ -1,0 +1,81 @@
+name: run
+
+on:
+  workflow_dispatch:
+    inputs:
+      ep_id:
+        description: "Episode ID"
+        required: true
+        default: "T01_EP003_B1"
+      level:
+        description: "CEFR Level"
+        required: false
+        default: "B1"
+      tab:
+        description: "Sheet Tab"
+        required: false
+        default: "1_Broadcast_Schedule"
+      row_id:
+        description: "Row ID"
+        required: false
+        default: "4"
+      force:
+        description: "Force regenerate existing segments"
+        required: false
+        default: "false"
+  repository_dispatch:
+    types: [run]
+
+jobs:
+  omni:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      EP_ID: ${{ github.event.inputs.ep_id || github.event.client_payload.ep_id || 'T01_EP003_B1' }}
+      LEVEL: ${{ github.event.inputs.level || github.event.client_payload.level || 'B1' }}
+      TAB: ${{ github.event.inputs.tab || github.event.client_payload.tab || '1_Broadcast_Schedule' }}
+      ROW_ID: ${{ github.event.inputs.row_id || github.event.client_payload.row_id || '4' }}
+      FORCE: ${{ github.event.inputs.force || github.event.client_payload.force || 'false' }}
+      OMNIVOICE_MODEL: "k2-fsa/OmniVoice"
+      GDRIVE_PRODUCTION_FOLDER_ID: ${{ secrets.GDRIVE_PRODUCTION_FOLDER_ID }}
+      GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GDRIVE_ROOT_FOLDER_ID }}
+      SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache k2-fsa/OmniVoice HuggingFace weights
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: omnivoice-hf-v1
+
+      - name: Install k2-fsa/OmniVoice, FFmpeg & rclone
+        run: |
+          sudo apt-get update -y && sudo apt-get install -y ffmpeg libsndfile1 rclone
+          python3 -m pip install --upgrade pip omnivoice soundfile pillow numpy requests google-auth
+
+      - name: Configure ephemeral rclone in RAM
+        env:
+          RCLONE_CONF_B64: ${{ secrets.GDRIVE_RCLONE_CONF }}
+          SA_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          mkdir -p ~/.config/rclone /dev/shm/omni
+          if [ -n "$RCLONE_CONF_B64" ]; then
+            echo "$RCLONE_CONF_B64" | base64 -d > ~/.config/rclone/rclone.conf 2>/dev/null || echo "$RCLONE_CONF_B64" > ~/.config/rclone/rclone.conf
+          fi
+          if [ -n "$SA_JSON" ]; then
+            echo "$SA_JSON" > /dev/shm/omni/sa.json
+            echo "GOOGLE_APPLICATION_CREDENTIALS=/dev/shm/omni/sa.json" >> "$GITHUB_ENV"
+          fi
+
+      - name: Run k2-fsa/OmniVoice Zero-Shot Voice Cloning
+        run: |
+          ARGS="--ep-id ${EP_ID} --level ${LEVEL}"
+          if [ "${FORCE}" = "true" ]; then ARGS="${ARGS} --force"; fi
+          python3 runner.py ${ARGS}
