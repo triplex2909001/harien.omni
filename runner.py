@@ -1,14 +1,26 @@
 #!/usr/bin/env python3
-import argparse, datetime, json, os, shutil, subprocess, sys, tarfile
+"""HanaRio English OmniVoice Runner (`triplex2909001/harien.omni`).
+Supports BOTH:
+  1. 3D Templates (`T01`–`T08`, e.g. `T01_EP003_B1`) -> `hook.wav`, `vo.wav`, `st.wav` / `outro.wav`
+  2. 2D Word Origin (`POST_...`, e.g. `POST_002_SALARY`) -> `01_audio/s01.wav` .. `s04.wav` on GDrive SSOT
+Rule: File length <= 150 lines (AGENTS.md).
+"""
+import argparse, datetime, json, os, shutil, subprocess, sys, tarfile, urllib.parse, urllib.request
 
 OMNIVOICE_REPO = "k2-fsa/OmniVoice"
+DEFAULT_PROD_ID = "1n159pEnGwSzmTA3A0Q_Twa1qWx6PWL2a"
+FALLBACK_ENGINE_IDS = ("1n159pEnGwSzmTA3A0Q_Twa1qWx6PWL2a", "1MXWYrQCwish5gBWwIkYnm1y9Son41Gya")
+WORD_ORIGIN_SHEET_ID = "1-kRNOm1qj8XGDpayafESy2vkhC6KUNSDB2ApgZjfaiM"
 
 
 def get_remote() -> str:
     if not shutil.which("rclone"):
         return ""
-    res = subprocess.run(["rclone", "listremotes"], capture_output=True, text=True)
-    return next((l.strip().rstrip(":") for l in res.stdout.splitlines() if l.strip().endswith(":")), "")
+    out = [l.strip() for l in subprocess.run(["rclone", "listremotes"], capture_output=True, text=True).stdout.splitlines() if l.strip().endswith(":")]
+    for pref in ("aleron.dt:", "vpsg24gb.aleron.dt:"):
+        if pref in out:
+            return pref.rstrip(":")
+    return out[0].rstrip(":") if out else ""
 
 
 def rclone_args(prod_id: str) -> list:
@@ -35,11 +47,18 @@ def gdrive_push(remote: str, prod_id: str, local_path: str, rel_path: str) -> bo
     return subprocess.run(["rclone", "copyto", local_path, f"{remote}:/{rel_path}", *rclone_args(prod_id)], capture_output=True).returncode == 0
 
 
-def ensure_engine(remote: str, prod_id: str):
-    if os.path.exists("scripts/gha_engine_helper.py"):
+def ensure_engine(remote: str, prod_id: str, ep_id: str):
+    if ep_id.upper().startswith("POST_") and os.path.exists("scripts/word_origin_gha_engine.py"):
+        return
+    if os.path.exists("studio/outputs") and os.path.exists("scripts/gha_engine_helper.py"):
         return
     tar_p = "/tmp/engine_bundle.tar.gz"
-    if not gdrive_pull(remote, prod_id, "_ENGINE/engine_bundle.tar.gz", tar_p):
+    pulled = False
+    for fid in dict.fromkeys([prod_id, *FALLBACK_ENGINE_IDS]):
+        if fid and gdrive_pull(remote, fid, "_ENGINE/engine_bundle.tar.gz", tar_p):
+            pulled = True
+            break
+    if not pulled:
         raise RuntimeError("Failed to pull _ENGINE/engine_bundle.tar.gz from PRODUCTION")
     with tarfile.open(tar_p, "r:gz") as tf:
         tf.extractall(".")
@@ -47,7 +66,28 @@ def ensure_engine(remote: str, prod_id: str):
 
 def verify_omnivoice_ready():
     import omnivoice  # noqa: F401 — https://github.com/k2-fsa/OmniVoice
-    print(f"[✓] Verified {OMNIVOICE_REPO} package ready.")
+    print(f"[✓] Verified {OMNIVOICE_REPO} package ready.", flush=True)
+
+
+def update_word_origin_sheet_status(post_id: str, status_str: str):
+    try:
+        import configparser
+        cp = configparser.ConfigParser()
+        cp.read(os.path.expanduser("~/.config/rclone/rclone.conf"))
+        sec = "aleron.dt" if "aleron.dt" in cp else (cp.sections()[0] if cp.sections() else "")
+        if not sec:
+            return
+        tok = json.loads(cp[sec]["token"])["access_token"]
+        hdrs = {"Authorization": f"Bearer {tok}", "Content-Type": "application/json"}
+        rng = urllib.parse.quote("'WORD ORIGIN'!A1:A30")
+        rows = json.loads(urllib.request.urlopen(urllib.request.Request(f"https://sheets.googleapis.com/v4/spreadsheets/{WORD_ORIGIN_SHEET_ID}/values/{rng}", headers=hdrs), timeout=15).read().decode()).get("values", [])
+        for idx, r in enumerate(rows, 1):
+            if r and str(r[0]).strip() == post_id:
+                wr = urllib.parse.quote(f"'WORD ORIGIN'!N{idx}")
+                urllib.request.urlopen(urllib.request.Request(f"https://sheets.googleapis.com/v4/spreadsheets/{WORD_ORIGIN_SHEET_ID}/values/{wr}?valueInputOption=USER_ENTERED", data=json.dumps({"values": [[status_str]]}).encode(), method="PUT", headers=hdrs), timeout=15)
+                break
+    except Exception as e:
+        print(f"[Sheet Update Warning] {e}", flush=True)
 
 
 def main():
@@ -57,15 +97,27 @@ def main():
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
 
-    ep_id, prod_id, remote = args.ep_id, os.environ.get("GDRIVE_PRODUCTION_FOLDER_ID", "").strip(), get_remote()
-    ensure_engine(remote, prod_id)
+    ep_id = args.ep_id.strip()
+    prod_id = os.environ.get("GDRIVE_PRODUCTION_FOLDER_ID", "").strip() or DEFAULT_PROD_ID
+    remote = get_remote()
+    ensure_engine(remote, prod_id, ep_id)
     if os.environ.get("GITHUB_ACTIONS") == "true":
         verify_omnivoice_ready()
     sys.path.insert(0, os.getcwd())
-    from scripts.gha_engine_helper import build_omni_voice_files
 
     wdir, vdir = os.path.join("workspace", ep_id), os.path.join("workspace", ep_id, "voice")
     os.makedirs(vdir, exist_ok=True)
+
+    # Branch 1: Word Origin 2D (POST_...)
+    if ep_id.upper().startswith("POST_"):
+        from scripts.word_origin_gha_engine import run_omnivoice_word_origin
+        created = run_omnivoice_word_origin(ep_id, wdir, args.level, force=args.force)
+        update_word_origin_sheet_status(ep_id, "OMNIVOICE_GHA_DONE")
+        print(f"[PASS] harien.omni ({OMNIVOICE_REPO}) completed Word Origin 2D tracks: {created}", flush=True)
+        return
+
+    # Branch 2: 3D Templates (T01–T08)
+    from scripts.gha_engine_helper import build_omni_voice_files
     man_local = os.path.join(wdir, "manifest.json")
     if not gdrive_pull(remote, prod_id, f"{ep_id}/manifest.json", man_local):
         cand = f"studio/episodes/{ep_id}/manifest.json"
