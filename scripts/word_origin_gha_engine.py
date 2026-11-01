@@ -107,7 +107,7 @@ def _synth_omnivoice_scene(spk: str, lang: str, spd: float, text: str, wav_p: st
             dt = torch.float16 if torch.cuda.is_available() else torch.float32
             _MODEL_CACHE = OmniVoice.from_pretrained("k2-fsa/OmniVoice", device_map=dev, dtype=dt, load_asr=False)
         sig = set(inspect.signature(_MODEL_CACHE.generate).parameters.keys())
-        ptxt = text.strip() if text.strip().endswith("?") else f"{text.strip().rstrip(.!)}..."
+        ptxt = text.strip() if text.strip().endswith("?") else f"{text.strip().rstrip(".!")}..."
         kw = {"text": ptxt, "ref_audio": _pad_ref_audio(ref_wav, spk), "ref_text": ref_txt}
         if "speed" in sig:
             kw["speed"] = 0.95
